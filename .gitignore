@@ -4,6 +4,7 @@ target/
 
 # Zed build output
 extension.wasm
+dist/
 
 # JavaScript leftovers
 node_modules/

@@ -4,8 +4,8 @@ use zed_extension_api::{self as zed, Result};
 
 const SERVER_ID: &str = "ejs-lsp";
 const SERVER_DIR: &str = "ejs-lsp";
-const GITHUB_REPO: &str = "Binh/zed-ejs";
-const PLACEHOLDER_GITHUB_REPO: &str = "Binh/zed-ejs";
+const GITHUB_REPO: &str = "binhphan7588/zed-ejs";
+const PLACEHOLDER_GITHUB_REPO: &str = "";
 const LOCAL_DEV_SERVER_PATH: &str = "C:/Users/Binh/Downloads/zed-ejs/ejs-lsp/ejs-lsp.exe";
 const EMMET_SERVER_ID: &str = "emmet-language-server";
 const EMMET_SERVER_PATH: &str = "node_modules/@olrtg/emmet-language-server/dist/index.js";

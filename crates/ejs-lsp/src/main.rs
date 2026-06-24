@@ -258,6 +258,12 @@ mod ejs_formatter {
         Text(String),
     }
 
+    #[derive(Debug, Clone)]
+    struct PositionedToken {
+        token: Token,
+        blank_before: bool,
+    }
+
     pub fn format_document(source: &str, options: FormatOptions) -> String {
         let (front_matter, body) = split_front_matter(source);
         let formatted_body = format_body(body, options);
@@ -273,8 +279,12 @@ mod ejs_formatter {
         let mut lines = Vec::new();
         let mut indent = 0usize;
 
-        for token in tokenize(source) {
-            match token {
+        for positioned in tokenize(source) {
+            if positioned.blank_before && should_preserve_blank_before(&positioned.token) {
+                push_blank_line(&mut lines);
+            }
+
+            match positioned.token {
                 Token::Text(text) => {
                     let text = collapse_ws(text.trim());
                     if !text.is_empty() {
@@ -329,19 +339,24 @@ mod ejs_formatter {
         (None, source)
     }
 
-    fn tokenize(source: &str) -> Vec<Token> {
+    fn tokenize(source: &str) -> Vec<PositionedToken> {
         let mut tokens = Vec::new();
         let mut cursor = 0;
+        let mut pending_blank_before = false;
 
         while cursor < source.len() {
             let rest = &source[cursor..];
             if rest.starts_with("<%") {
                 if let Some(end) = rest.find("%>") {
                     let end = cursor + end + 2;
-                    tokens.push(Token::EjsTag(source[cursor..end].to_string()));
+                    push_token(
+                        &mut tokens,
+                        Token::EjsTag(source[cursor..end].to_string()),
+                        &mut pending_blank_before,
+                    );
                     cursor = end;
                 } else {
-                    tokens.push(Token::Text(rest.to_string()));
+                    push_text_or_blank(&mut tokens, rest, &mut pending_blank_before);
                     break;
                 }
             } else if rest.starts_with('<') {
@@ -349,16 +364,22 @@ mod ejs_formatter {
                     let end = cursor + relative_end + 1;
                     let opening = source[cursor..end].trim();
                     if let Some(inline_end) = inline_element_end(source, end, opening) {
-                        tokens.push(Token::InlineHtml(
-                            source[cursor..inline_end].trim().to_string(),
-                        ));
+                        push_token(
+                            &mut tokens,
+                            Token::InlineHtml(source[cursor..inline_end].trim().to_string()),
+                            &mut pending_blank_before,
+                        );
                         cursor = inline_end;
                     } else {
-                        tokens.push(Token::HtmlTag(opening.to_string()));
+                        push_token(
+                            &mut tokens,
+                            Token::HtmlTag(opening.to_string()),
+                            &mut pending_blank_before,
+                        );
                         cursor = end;
                     }
                 } else {
-                    tokens.push(Token::Text(rest.to_string()));
+                    push_text_or_blank(&mut tokens, rest, &mut pending_blank_before);
                     break;
                 }
             } else {
@@ -366,7 +387,11 @@ mod ejs_formatter {
                     .find('<')
                     .map(|index| cursor + index)
                     .unwrap_or(source.len());
-                tokens.push(Token::Text(source[cursor..next].to_string()));
+                push_text_or_blank(
+                    &mut tokens,
+                    &source[cursor..next],
+                    &mut pending_blank_before,
+                );
                 cursor = next;
             }
         }
@@ -374,13 +399,60 @@ mod ejs_formatter {
         tokens
     }
 
+    fn push_token(tokens: &mut Vec<PositionedToken>, token: Token, pending_blank_before: &mut bool) {
+        tokens.push(PositionedToken {
+            token,
+            blank_before: *pending_blank_before,
+        });
+        *pending_blank_before = false;
+    }
+
+    fn push_text_or_blank(
+        tokens: &mut Vec<PositionedToken>,
+        text: &str,
+        pending_blank_before: &mut bool,
+    ) {
+        if text.trim().is_empty() {
+            *pending_blank_before |= has_blank_line(text);
+            return;
+        }
+
+        push_token(tokens, Token::Text(text.to_string()), pending_blank_before);
+    }
+
+    fn has_blank_line(text: &str) -> bool {
+        let newline_count = text.chars().filter(|character| *character == '\n').count();
+        newline_count >= 2
+    }
+
+    fn should_preserve_blank_before(token: &Token) -> bool {
+        match token {
+            Token::HtmlTag(tag) => is_block_level_html_tag(tag),
+            Token::EjsTag(tag) => {
+                let (_, _, code) = split_ejs_tag(tag);
+                let code = code.trim();
+                code.starts_with("if ")
+                    || code.starts_with("for ")
+                    || code.starts_with("while ")
+                    || code.starts_with("switch ")
+                    || code.starts_with('}')
+            }
+            Token::InlineHtml(_) | Token::Text(_) => false,
+        }
+    }
+
+    fn push_blank_line(lines: &mut Vec<String>) {
+        if !lines.is_empty() && !lines.last().is_some_and(|line| line.is_empty()) {
+            lines.push(String::new());
+        }
+    }
+
     fn find_html_tag_end(text: &str) -> Option<usize> {
         let mut quote = None;
         let mut index = 0;
-        let bytes = text.as_bytes();
 
-        while index < bytes.len() {
-            let current = bytes[index] as char;
+        while index < text.len() {
+            let current = text[index..].chars().next()?;
 
             if quote.is_none() && text[index..].starts_with("<%") {
                 if let Some(end) = text[index + 2..].find("%>") {
@@ -422,7 +494,10 @@ mod ejs_formatter {
             if !inner.contains('<') && !inner.trim().is_empty() && !inner.contains('\n') {
                 return Some(opening_end + closing_start + closing.len());
             }
-            if is_phrasing_container(&name) && is_phrasing_content(inner) {
+            if is_phrasing_container(&name)
+                && is_phrasing_content(inner)
+                && !(is_heading_tag(&name) && has_intentional_multiline_text(inner))
+            {
                 return Some(opening_end + closing_start + closing.len());
             }
         }
@@ -561,7 +636,7 @@ mod ejs_formatter {
                 if trimmed.is_empty() {
                     None
                 } else {
-                    Some(line.len() - line.trim_start().len())
+                    Some(line.chars().take_while(|character| character.is_whitespace()).count())
                 }
             })
             .min()
@@ -573,10 +648,23 @@ mod ejs_formatter {
                 if line.trim().is_empty() {
                     String::new()
                 } else {
-                    line[min_indent..].trim_end().to_string()
+                    strip_leading_whitespace_chars(line, min_indent)
+                        .trim_end()
+                        .to_string()
                 }
             })
             .collect()
+    }
+
+    fn strip_leading_whitespace_chars(line: &str, count: usize) -> &str {
+        let mut stripped = 0usize;
+        for (index, character) in line.char_indices() {
+            if stripped >= count || !character.is_whitespace() {
+                return &line[index..];
+            }
+            stripped += 1;
+        }
+        ""
     }
 
     fn format_multiline_js(code: &str, options: FormatOptions) -> String {
@@ -1142,7 +1230,23 @@ mod ejs_formatter {
             cursor = next;
         }
 
-        output.trim().to_string()
+        normalize_void_element_slash(output.trim())
+    }
+
+    fn normalize_void_element_slash(tag: &str) -> String {
+        let Some(name) = tag_name(tag) else {
+            return tag.to_string();
+        };
+        if !is_html_void_element(&name) || !tag.trim_end().ends_with("/>") {
+            return tag.to_string();
+        }
+
+        tag.trim_end()
+            .trim_end_matches('>')
+            .trim_end_matches('/')
+            .trim_end()
+            .to_string()
+            + ">"
     }
 
     fn push_pending_inline_space(output: &mut String, pending_space: bool) {
@@ -1227,7 +1331,7 @@ mod ejs_formatter {
             cursor += current.len_utf8();
         }
 
-        output.trim().to_string()
+        normalize_void_element_slash(output.trim())
     }
 
     fn should_insert_space(output: &str) -> bool {
@@ -1270,6 +1374,13 @@ mod ejs_formatter {
         tag.starts_with("</")
     }
 
+    fn is_block_level_html_tag(tag: &str) -> bool {
+        let Some(name) = tag_name(tag) else {
+            return false;
+        };
+        !is_phrasing_tag(&name)
+    }
+
     fn is_opening_tag(tag: &str) -> bool {
         if tag.starts_with("</")
             || tag.starts_with("<!")
@@ -1280,8 +1391,16 @@ mod ejs_formatter {
         }
 
         let name = tag_name(tag).unwrap_or_default();
-        !matches!(
-            name.as_str(),
+        !is_html_void_element(&name)
+    }
+
+    fn is_raw_text_tag(name: &str) -> bool {
+        matches!(name, "script" | "style" | "pre" | "textarea")
+    }
+
+    fn is_html_void_element(name: &str) -> bool {
+        matches!(
+            name,
             "area"
                 | "base"
                 | "br"
@@ -1299,12 +1418,29 @@ mod ejs_formatter {
         )
     }
 
-    fn is_raw_text_tag(name: &str) -> bool {
-        matches!(name, "script" | "style" | "pre" | "textarea")
+    fn is_phrasing_container(name: &str) -> bool {
+        is_phrasing_tag(name)
+            || matches!(
+                name,
+                "p" | "dt"
+                    | "dd"
+                    | "figcaption"
+                    | "caption"
+                    | "h1"
+                    | "h2"
+                    | "h3"
+                    | "h4"
+                    | "h5"
+                    | "h6"
+            )
     }
 
-    fn is_phrasing_container(name: &str) -> bool {
-        is_phrasing_tag(name) || matches!(name, "p" | "dt" | "dd" | "figcaption" | "caption")
+    fn has_intentional_multiline_text(source: &str) -> bool {
+        source.lines().filter(|line| !line.trim().is_empty()).count() > 1
+    }
+
+    fn is_heading_tag(name: &str) -> bool {
+        matches!(name, "h1" | "h2" | "h3" | "h4" | "h5" | "h6")
     }
 
     fn is_phrasing_tag(name: &str) -> bool {
@@ -1467,6 +1603,32 @@ mod ejs_formatter {
         }
 
         #[test]
+        fn preserves_single_empty_line_between_block_tags() {
+            let input = "<main><section><h2>One</h2></section>\n\n<section><h2>Two</h2></section></main>";
+            let output = format_default(input);
+
+            assert!(output.contains("</section>\n\n  <section>"));
+        }
+
+        #[test]
+        fn collapses_multiple_empty_lines_between_block_tags() {
+            let input = "<main><section><h2>One</h2></section>\n\n\n\n<section><h2>Two</h2></section></main>";
+            let output = format_default(input);
+
+            assert!(output.contains("</section>\n\n  <section>"));
+            assert!(!output.contains("</section>\n\n\n"));
+        }
+
+        #[test]
+        fn does_not_preserve_empty_line_inside_inline_content() {
+            let input = "<p>Hello\n\n<span>World</span></p>";
+            let output = format_default(input);
+
+            assert!(output.contains("<p>Hello <span>World</span></p>"));
+            assert!(!output.contains("Hello\n\n"));
+        }
+
+        #[test]
         fn keeps_ejs_inside_html_attributes() {
             let input = "<head><title><%= file.data.title %></title><meta name=\"description\" content=\"<%= pageDescription %>\"><link rel=\"canonical\" href=\"<%= pageUrl %>\"></head>";
             let output = format_default(input);
@@ -1541,6 +1703,31 @@ mod ejs_formatter {
         }
 
         #[test]
+        fn removes_self_closing_slash_from_html_void_elements() {
+            let input = "<head><meta charset=\"utf-8\" /><link rel=\"stylesheet\" href=\"style.css\" /></head><body><img src=\"a.webp\" alt=\"\" /><br /></body>";
+            let output = format_default(input);
+
+            assert!(output.contains("<meta charset=\"utf-8\">"), "{output}");
+            assert!(
+                output.contains("<link rel=\"stylesheet\" href=\"style.css\">"),
+                "{output}"
+            );
+            assert!(output.contains("<img src=\"a.webp\" alt=\"\">"), "{output}");
+            assert!(output.contains("<br>"), "{output}");
+            assert!(!output.contains("<meta charset=\"utf-8\" />"));
+            assert!(!output.contains("<img src=\"a.webp\" alt=\"\" />"));
+        }
+
+        #[test]
+        fn handles_unicode_inside_html_tags() {
+            let input = "<meta name=\"description\" content=\"\u{907a}\u{7523}\u{76f8}\u{7d9a}\"><main>\u{4f1a}\u{6d25}\u{82e5}\u{677e}\u{5e02}</main>";
+            let output = format_default(input);
+
+            assert!(output.contains("<meta name=\"description\" content=\"\u{907a}\u{7523}\u{76f8}\u{7d9a}\">"));
+            assert!(output.contains("\u{4f1a}\u{6d25}\u{82e5}\u{677e}\u{5e02}"));
+        }
+
+        #[test]
         fn formats_js_expressions_without_breaking_literals() {
             let input = "<p><%=user.name??fallback.replace(/\\s+/g,\" \").trim()%></p>";
             let output = format_default(input);
@@ -1566,6 +1753,15 @@ mod ejs_formatter {
             assert!(output.contains("\n} else {"));
             assert!(output.contains("\n    const label = \"No users\";"));
             assert!(output.contains("\n} %>"));
+        }
+
+        #[test]
+        fn handles_unicode_in_multiline_js_blocks() {
+            let input = "<%\n    const label = \"\u{907a}\u{7523}\u{76f8}\u{7d9a}\";\n    const title = \"\u{4f1a}\u{6d25}\u{82e5}\u{677e}\u{5e02}\";\n%>";
+            let output = format_default(input);
+
+            assert!(output.contains("const label = \"\u{907a}\u{7523}\u{76f8}\u{7d9a}\";"));
+            assert!(output.contains("const title = \"\u{4f1a}\u{6d25}\u{82e5}\u{677e}\u{5e02}\";"));
         }
 
         #[test]
@@ -1618,6 +1814,28 @@ mod ejs_formatter {
             assert!(output.contains("<p class=\"close\"><a href=\"javascript:void(0)\" data-gdpr=\"button\" style=\"display: inline-block;\">Agree</a></p>"));
             assert!(!output.contains("<p class=\"close\">\n"));
             assert!(!output.contains(">\n    Agree"));
+        }
+
+        #[test]
+        fn keeps_single_line_heading_with_br_inline() {
+            let input = "<section><h3 class=\"c-cdbox-title\">地域に寄り添い<br>想いと住まいを守る仕事を</h3></section>";
+            let output = format_default(input);
+
+            assert!(output.contains(
+                "<h3 class=\"c-cdbox-title\">地域に寄り添い<br>想いと住まいを守る仕事を</h3>"
+            ));
+        }
+
+        #[test]
+        fn preserves_intentional_multiline_heading_text() {
+            let input = "<section><h3 class=\"c-cdbox-title\">\n  地域に寄り添い\n  <br>\n  想いと住まいを守る仕事を\n</h3></section>";
+            let output = format_default(input);
+
+            assert!(output.contains("<h3 class=\"c-cdbox-title\">"));
+            assert!(output.contains("\n    地域に寄り添い"));
+            assert!(output.contains("\n    <br>"));
+            assert!(output.contains("\n    想いと住まいを守る仕事を"));
+            assert!(!output.contains("地域に寄り添い <br> 想い"));
         }
     }
 }
