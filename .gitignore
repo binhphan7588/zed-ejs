@@ -1,0 +1,13 @@
+# Rust build output
+target/
+**/target/
+
+# Zed build output
+extension.wasm
+
+# JavaScript leftovers
+node_modules/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
